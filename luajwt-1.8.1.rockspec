@@ -1,4 +1,4 @@
-package = "luajwtjitsi"
+package = "luajwt"
 version = "1.8"
 
 source = {
@@ -23,6 +23,6 @@ dependencies = {
 build = {
 	type = "builtin",
 	modules = {
-		luajwtjitsi = "luajwtjitsi.lua"
+		luajwt = "luajwt.lua"
 	}
 }

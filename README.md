@@ -3,6 +3,9 @@ luajwt
 
 JSON Web Tokens for Lua
 
+This repo is a fork of https://github.com/paweldomas/luajwt , which in turn is a fork
+of https://github.com/x25/luajwt
+
 ```bash
 $ sudo luarocks install --server=http://rocks.moonscript.org luajwt
 ```
