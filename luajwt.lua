@@ -1,8 +1,20 @@
-local cjson  = require 'cjson'
-local base64 = require 'base64'
+local b64 = nil
+local unb64 = nil
+local http = nil
+if ngx ~= nil then
+  b64 = ngx.encode_base64
+  unb64 = ngx.decode_base64
+  http = require "resty.http"
+else
+  local base64 = require 'base64'
+  b64 = base64.encode
+  unb64 = base64.decode
+end
+local cjson  = require'cjson'
 local digest = require 'openssl.digest'
-local hmac   = require 'openssl.hmac'
 local pkey   = require 'openssl.pkey'
+local x509   = require 'openssl.x509'
+local hmac   = require 'openssl.hmac'
 
 function safe_require(mod)
   local status, loadedMod = pcall(function() return require(mod) end)
@@ -11,6 +23,14 @@ function safe_require(mod)
   else
     return status, loadedMod
   end
+end
+
+local config = safe_require "config"
+
+if not config then
+  config = {
+     ssl_verify = true
+  }
 end
 
 local bit = safe_require'bit'
@@ -60,7 +80,10 @@ end
 
 local function signRS(data, key, algo)
     local ok, result = pcall(function()
-      return pkey.new(key):sign(digest.new(algo):update(data))
+      if type(key) == 'string' then
+        key = pkey.new(key)
+      end
+      return key:sign(digest.new(algo):update(data))
     end)
     if not ok then return nil, result end
     return result
@@ -68,7 +91,10 @@ end
 
 local function verifyRS(data, signature, key, algo)
     local ok, result = pcall(function()
-      return pkey.new(key):verify(signature, digest.new(algo):update(data))
+      if type(key) == 'string' then
+        key = pkey.new(key)
+      end
+      return key:verify(signature, digest.new(algo):update(data))
     end)
     if not ok then return nil, result end
     return result
@@ -92,15 +118,15 @@ local alg_verify = {
 	['RS512'] = function(data, signature, key) return verifyRS(data, signature, key, 'sha512') end
 }
 
-local function b64_encode(input)
-	local result = base64.encode(input)
+local function b64_url_encode(input)
+	local result = b64(input)
 
 	result = result:gsub('+','-'):gsub('/','_'):gsub('=','')
 
 	return result
 end
 
-local function b64_decode(input)
+local function b64_url_decode(input)
 --	input = input:gsub('\n', ''):gsub(' ', '')
 
 	local reminder = #input % 4
@@ -112,7 +138,7 @@ local function b64_decode(input)
 
 	input = input:gsub('-','+'):gsub('_','/')
 
-	return base64.decode(input)
+	return unb64(input)
 end
 
 local function tokenize(str, div, len)
@@ -150,8 +176,8 @@ function M.encode(data, key, alg)
 	local header = { typ='JWT', alg=alg }
 
 	local segments = {
-		b64_encode(cjson.encode(header)),
-		b64_encode(cjson.encode(data))
+		b64_url_encode(cjson.encode(header)),
+		b64_url_encode(cjson.encode(data))
 	}
 
 	local signing_input = table.concat(segments, ".")
@@ -160,15 +186,20 @@ function M.encode(data, key, alg)
 		return nil, error
 	end
 
-	segments[#segments+1] = b64_encode(signature)
+	segments[#segments+1] = b64_url_encode(signature)
 
 	return table.concat(segments, ".")
 end
 
-function M.decode(data, key, verify)
-	if key and verify == nil then verify = true end
+function M.decode(data, key, verify) 
+    local keyset = { default=key } 
+    return M.decode_keyset(data,keyset,verify)
+end
+
+function M.decode_keyset(data, keyset, verify)
+	if keyset and verify == nil then verify = true end
 	if type(data) ~= 'string' then return nil, "Argument #1 must be string" end
-	if verify and type(key) ~= 'string' then return nil, "Argument #2 must be string" end
+	if verify and type(keyset) ~= 'table' then return nil, "Argument #2 must be table" end
 
 	local token = tokenize(data, '.', 3)
 
@@ -179,10 +210,9 @@ function M.decode(data, key, verify)
 	local headerb64, bodyb64, sigb64 = token[1], token[2], token[3]
 
 	local ok, header, body, sig = pcall(function ()
-
-		return	cjson.decode(b64_decode(headerb64)),
-			cjson.decode(b64_decode(bodyb64)),
-			b64_decode(sigb64)
+		return	cjson.decode(b64_url_decode(headerb64)),
+			cjson.decode(b64_url_decode(bodyb64)),
+			b64_url_decode(sigb64)
 	end)
 
 	if not ok then
@@ -210,9 +240,18 @@ function M.decode(data, key, verify)
 		if not alg_verify[header.alg] then
 			return nil, "Algorithm not supported"
 		end
+        
+        local kid = header.kid
+
+        local key = keyset[kid] or keyset["default"]
+
+        if key == nil then
+			return nil, "no key could be found to validate the token"
+        end
 
 		local verify_result, error
 			= alg_verify[header.alg](headerb64 .. "." .. bodyb64, sig, key);
+
 		if verify_result == nil then
 			return nil, error
 		elseif verify_result == false then
@@ -229,6 +268,155 @@ function M.decode(data, key, verify)
 	end
 
 	return body
+end
+
+-- Beginning of code adapted from https://github.com/zmartzone/lua-resty-openidc
+-- released under the APACHE license, see license terms and authors in the
+-- licenses/lua-resty-openidc/ directory
+
+local function split_by_chunk(text, chunkSize)
+  local s = {}
+  for i = 1, #text, chunkSize do
+    s[#s + 1] = text:sub(i, i + chunkSize - 1)
+  end
+  return s
+end
+
+local wrap = ('.'):rep(64)
+
+local envelope = "-----BEGIN %s-----\n%s\n-----END %s-----\n"
+
+local function der2pem(data, typ)
+  typ = typ:upper() or "CERTIFICATE"
+  data = b64(data)
+  return string.format(envelope, typ, data:gsub(wrap, '%0\n', (#data - 1) / 64), typ)
+end
+
+
+local function encode_length(length)
+  if length < 0x80 then
+    return string.char(length)
+  elseif length < 0x100 then
+    return string.char(0x81, length)
+  elseif length < 0x10000 then
+    return string.char(0x82, math.floor(length / 0x100), length % 0x100)
+  end
+  error("Can't encode lengths over 65535")
+end
+
+
+local function encode_sequence(array, of)
+  local encoded_array = array
+  if of then
+    encoded_array = {}
+    for i = 1, #array do
+      encoded_array[i] = of(array[i])
+    end
+  end
+  encoded_array = table.concat(encoded_array)
+
+  return string.char(0x30) .. encode_length(#encoded_array) .. encoded_array
+end
+
+local function encode_binary_integer(bytes)
+  if bytes:byte(1) > 127 then
+    -- We currenly only use this for unsigned integers,
+    -- however since the high bit is set here, it would look
+    -- like a negative signed int, so prefix with zeroes
+    bytes = "\0" .. bytes
+  end
+  return "\2" .. encode_length(#bytes) .. bytes
+end
+
+local function encode_sequence_of_integer(array)
+  return encode_sequence(array, encode_binary_integer)
+end
+
+local function encode_bit_string(array)
+  local s = "\0" .. array -- first octet holds the number of unused bits
+  return "\3" .. encode_length(#s) .. s
+end
+
+local function openidc_pem_from_x5c(x5c)
+  -- TODO check x5c length
+  print("Found x5c, getting PEM public key from x5c entry of json public key")
+  local chunks = split_by_chunk(b64(b64_url_decode(x5c[1])), 64)
+  local pem = "-----BEGIN CERTIFICATE-----\n" ..
+      table.concat(chunks, "\n") ..
+      "\n-----END CERTIFICATE-----"
+  print("Generated PEM key from x5c:", pem)
+  return pem
+end
+
+local function openidc_pem_from_rsa_n_and_e(n, e)
+  print("getting PEM public key from n and e parameters of json public key")
+
+  local der_key = {
+    b64_url_decode(n), b64_url_decode(e)
+  }
+  local encoded_key = encode_sequence_of_integer(der_key)
+  local pem = der2pem(encode_sequence({
+    encode_sequence({
+      "\6\9\42\134\72\134\247\13\1\1\1" -- OID :rsaEncryption
+          .. "\5\0" -- ASN.1 NULL of length 0
+    }),
+    encode_bit_string(encoded_key)
+  }), "PUBLIC KEY")
+  print("Generated pem key from n and e: ", pem)
+  return pem
+end
+
+function M.public_key_from_jwk(jwk)
+  local pem
+  -- TODO check x5c length
+  if jwk.x5c then
+    pem = x509.new(openidc_pem_from_x5c(jwk.x5c)):getPublicKey()
+  elseif jwk.kty == "RSA" and jwk.n and jwk.e then
+    pem = pkey.new(openidc_pem_from_rsa_n_and_e(jwk.n, jwk.e))
+  else
+    return nil, "don't know how to create RSA key/cert for " .. cjson.encode(jwk)
+  end
+
+  return pem
+end
+
+-- END of adapted code
+--
+
+function M.public_keys_from_jwks(jwks)
+    local ret = {}
+    for _,entry in ipairs(jwks.keys) do
+       ret[entry.kid] = M.public_key_from_jwk(entry)
+    end
+    return ret
+end
+
+function M.get_jwks_from_authentication_server(host)
+  local httpc = http.new()
+  local res, err = httpc:request_uri(host, {
+    method = "GET",
+    headers = {
+      ["Accept"] = "application/json"
+    },
+    keepalive_timeout = 60,
+    keepalive_pool = 10,
+    ssl_verify=config.ssl_verify
+  })
+  
+  if res and 200 <= res.status and res.status < 300 then
+     return cjson.decode(res.body) 
+  else
+     ngx.log(ngx.ERR, err)
+  end
+  return nil, err
+end
+
+function M.get_public_keys_from_authentication_server(host)
+    local jwks,err = M.get_jwks_from_authentication_server(host)
+    if jwks ~= nil then
+        return M.public_keys_from_jwks(jwks)
+    end
+    return nil,err
 end
 
 return M
